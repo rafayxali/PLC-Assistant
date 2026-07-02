@@ -1,3 +1,16 @@
+# Siemens Manuals
+data/manuals/
+
+# Extracted Images
+data/images/
+
+# Processed Chunks
+data/processed/
+
+# Vector Cache
+*.sqlite
+*.db
+
 # Python
 __pycache__/
 *.pyc
