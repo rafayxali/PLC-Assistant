@@ -1,10 +1,27 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 
 # ======================================================
 # Request Payload Schema
 # ======================================================
 class ChatRequest(BaseModel):
+    # Without this, FastAPI's /docs (Swagger UI) auto-fills every optional
+    # string field with the placeholder "string" in the try-it-out example,
+    # which — if left unedited — gets sent as a real value and causes
+    # attached_image_path to be (wrongly) treated as a real file_id attempt,
+    # producing a 400. An explicit example fixes what /docs displays.
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "query": "How do I reset a fault code F0001 on a Siemens S7-1200?",
+                    "attached_image_path": None,
+                    "conversation_id": None,
+                }
+            ]
+        }
+    )
+
     query: Optional[str] = Field(
         None,
         description="The textual question or issue description submitted by the technician."
@@ -12,10 +29,11 @@ class ChatRequest(BaseModel):
     attached_image_path: Optional[str] = Field(
         None,
         description=(
-            "Identifier for the query-time photo uploaded by the technician. "
-            "This should be an internal file ID/UUID that maps to a known upload "
-            "directory server-side, NOT a raw client-supplied filesystem path or "
-            "arbitrary URL, to avoid path-traversal / arbitrary-file-read risk."
+            "Optional. The file_id (UUID) returned by POST /api/v1/upload for a "
+            "previously uploaded diagnostic photo. Omit or leave null for text-only "
+            "questions — this is NOT required. This must be an internal file ID/UUID, "
+            "NOT a raw client-supplied filesystem path or arbitrary URL, to avoid "
+            "path-traversal / arbitrary-file-read risk."
         )
     )
     conversation_id: Optional[str] = Field(
