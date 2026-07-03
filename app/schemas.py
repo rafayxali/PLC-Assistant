@@ -6,15 +6,20 @@ from typing import Optional, List, Dict, Any
 # ======================================================
 class ChatRequest(BaseModel):
     query: Optional[str] = Field(
-        None, 
+        None,
         description="The textual question or issue description submitted by the technician."
     )
     attached_image_path: Optional[str] = Field(
-        None, 
-        description="The local server disk path or URL of the query-time photo uploaded by the technician."
+        None,
+        description=(
+            "Identifier for the query-time photo uploaded by the technician. "
+            "This should be an internal file ID/UUID that maps to a known upload "
+            "directory server-side, NOT a raw client-supplied filesystem path or "
+            "arbitrary URL, to avoid path-traversal / arbitrary-file-read risk."
+        )
     )
     conversation_id: Optional[str] = Field(
-        None, 
+        None,
         description="UUID session identifier string. Omit on the first message to generate a new thread, pass it back on subsequent turns to maintain chat history."
     )
 
@@ -41,6 +46,17 @@ class SourceDocument(BaseModel):
         ..., description="The cosine similarity metric calculated by Qdrant (rounded to 4 decimals)."
     )
 
+class UploadResponse(BaseModel):
+    file_id: str = Field(
+        ..., description="Opaque UUID identifying the stored upload. Pass this back as `attached_image_path` on /api/v1/chat."
+    )
+
+class AvailableImage(BaseModel):
+    url: str = Field(..., description="The URL or disk path of a diagram/image available to reference.")
+    text: str = Field(..., description="The caption or description associated with the image.")
+    document_id: str = Field(..., description="The source manual document identifier.")
+    page_id: str = Field(..., description="The page number within the source document.")
+
 # ======================================================
 # Root Response Payload Schema
 # ======================================================
@@ -55,10 +71,14 @@ class ChatResponse(BaseModel):
         ..., description="Classification category label: 'text', 'image', or 'mixed'."
     )
     sources: List[SourceDocument] = Field(
-        default=[], 
+        default=[],
         description="Array of underlying manual references extracted during the cross-retrieval pipeline execution."
     )
     metadata: Dict[str, Any] = Field(
-        default={}, 
-        description="Arbitrary supplementary runtime telemetry metrics (e.g., token consumption tracking, internal graph flags)."
+        default={},
+        description=(
+            "Arbitrary supplementary runtime telemetry metrics (e.g., token consumption tracking, "
+            "internal graph flags, and 'available_images': List[AvailableImage] surfaced directly "
+            "from retrieval, independent of whether the LLM embedded them in markdown)."
+        )
     )

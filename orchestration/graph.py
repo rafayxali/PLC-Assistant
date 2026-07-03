@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import List, Optional, Dict, Any, Annotated
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
@@ -7,6 +8,8 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 
 # Ingestion/Retrieval & Generation deps
@@ -15,6 +18,16 @@ from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langchain_groq import ChatGroq
 
 load_dotenv()
+
+logger = logging.getLogger("aegis.graph")
+logging.basicConfig(level=logging.INFO)
+
+# ======================================================
+# Config
+# ======================================================
+# Cap how many prior turns get replayed into the LLM on every call.
+# Each "turn" here is one HumanMessage or one AIMessage entry.
+MAX_HISTORY_MESSAGES = 20  # ~10 user/assistant exchanges
 
 # ======================================================
 # State Schema Setup
@@ -29,6 +42,7 @@ class AegisState(TypedDict):
     retrieved_text_chunks: List[Dict[str, Any]]
     retrieved_image_captions: List[Dict[str, Any]]
     vlm_query_description: Optional[str]
+    available_images: List[Dict[str, Any]]
     final_response: Optional[str]
 
 # ======================================================
@@ -37,6 +51,7 @@ class AegisState(TypedDict):
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL")
 
 # Initialize Vector Search Model
 embeddings_model = HuggingFaceEndpointEmbeddings(
@@ -50,10 +65,20 @@ IMAGE_COLLECTION = "plc_manuals_images"
 
 # Initialize Groq Engine for ultra-fast generation
 llm = ChatGroq(
-    model="llama-3.3-70b-specdec", 
-    temperature=0.1, 
+    model="llama-3.3-70b-versatile",
+    temperature=0.1,
     groq_api_key=os.getenv("GROQ_API_KEY")
 )
+
+# ======================================================
+# Helpers
+# ======================================================
+def _s(value: Any) -> str:
+    """Safely coerce a payload value to str, avoiding the literal 'None' string
+    that str(None) would otherwise produce for genuinely-null payload fields."""
+    if value is None:
+        return ""
+    return str(value)
 
 # ======================================================
 # Graph Nodes (Workers)
@@ -61,12 +86,12 @@ llm = ChatGroq(
 
 def input_analysis_node(state: AegisState) -> dict:
     """
-    Step 1: Analyzes inbound technician data. Processes text requests 
+    Step 1: Analyzes inbound technician data. Processes text requests
     and handles diagnostic files without static mock text.
     """
     raw_query = state.get("user_query") or ""
     image_path = state.get("attached_image_path")
-    
+
     vlm_desc = None
     if image_path:
         filename = os.path.basename(image_path)
@@ -86,7 +111,7 @@ def input_analysis_node(state: AegisState) -> dict:
     messages_update = []
     if raw_query:
         messages_update.append(HumanMessage(content=raw_query))
-        
+
     return {
         "vlm_query_description": vlm_desc,
         "text_search_query": text_search,
@@ -106,14 +131,15 @@ def text_retrieval_node(state: AegisState) -> dict:
         query_vector = embeddings_model.embed_query(search_target)
         hits = qdrant_client.search(collection_name=TEXT_COLLECTION, query_vector=query_vector, limit=3)
         return {"retrieved_text_chunks": [{
-            "postgres_chunk_id": str(hit.payload.get("postgres_chunk_id", "")),
-            "document_id": str(hit.payload.get("document_id", "")),
-            "page_id": str(hit.payload.get("page_id", "")),
+            "postgres_chunk_id": _s(hit.payload.get("postgres_chunk_id")),
+            "document_id": _s(hit.payload.get("document_id")),
+            "page_id": _s(hit.payload.get("page_id")),
             "section_name": hit.payload.get("section_name"),
-            "text": str(hit.payload.get("text", "")),
+            "text": _s(hit.payload.get("text")),
             "similarity_score": hit.score
         } for hit in hits]}
     except Exception:
+        logger.exception("Text retrieval failed for query: %r", search_target)
         return {"retrieved_text_chunks": []}
 
 
@@ -129,16 +155,17 @@ def image_retrieval_node(state: AegisState) -> dict:
         query_vector = embeddings_model.embed_query(search_target)
         hits = qdrant_client.search(collection_name=IMAGE_COLLECTION, query_vector=query_vector, limit=3)
         return {"retrieved_image_captions": [{
-            "postgres_chunk_id": str(hit.payload.get("postgres_chunk_id", "")),
-            "document_id": str(hit.payload.get("document_id", "")),
-            "page_id": str(hit.payload.get("page_id", "")),
+            "postgres_chunk_id": _s(hit.payload.get("postgres_chunk_id")),
+            "document_id": _s(hit.payload.get("document_id")),
+            "page_id": _s(hit.payload.get("page_id")),
             "section_name": hit.payload.get("section_name"),
-            "text": str(hit.payload.get("text", "")),
+            "text": _s(hit.payload.get("text")),
             # Extract image_url or local disk source path if populated in database
-            "image_url": str(hit.payload.get("image_url") or hit.payload.get("image_path") or ""),
+            "image_url": _s(hit.payload.get("image_url") or hit.payload.get("image_path")),
             "similarity_score": hit.score
         } for hit in hits]}
     except Exception:
+        logger.exception("Image retrieval failed for query: %r", search_target)
         return {"retrieved_image_captions": []}
 
 
@@ -150,21 +177,27 @@ def context_synthesis_node(state: AegisState) -> dict:
     text_chunks = state.get("retrieved_text_chunks", [])
     img_captions = state.get("retrieved_image_captions", [])
     history = state.get("chat_history", [])
-    
+
     # Compile the retrieved reference context block
     context_blocks = []
     for c in text_chunks:
         context_blocks.append(f"[Manual Text | Doc: {c['document_id']} | Page: {c['page_id']}]: {c['text']}")
-    
-    # Store dynamic references to hardware images we have available
+
+    # Store dynamic references to hardware images we have available so the
+    # API layer can also surface them directly (not just via LLM markdown).
     available_images_context = []
     for i in img_captions:
         img_ref = f"[Visual Diagram | Doc: {i['document_id']} | Page: {i['page_id']}]: {i['text']}"
         if i.get("image_url"):
             img_ref += f"\n👉 AVAILABLE IMAGE REFERENCE FILE (URL/Path): {i['image_url']}"
-            available_images_context.append({"url": i['image_url'], "text": i['text']})
+            available_images_context.append({
+                "url": i["image_url"],
+                "text": i["text"],
+                "document_id": i["document_id"],
+                "page_id": i["page_id"],
+            })
         context_blocks.append(img_ref)
-        
+
     has_context = len(context_blocks) > 0
     context_str = "\n\n".join(context_blocks) if has_context else "No direct manual context retrieved."
 
@@ -199,18 +232,22 @@ def context_synthesis_node(state: AegisState) -> dict:
         f"CONTEXT:\n{context_str}"
     ))
 
-    full_messages = [system_instruction] + history
+    # Trim replayed history so long-running sessions don't blow up token usage
+    # or latency on every single turn.
+    trimmed_history = history[-MAX_HISTORY_MESSAGES:] if history else history
+    full_messages = [system_instruction] + trimmed_history
 
     try:
         llm_response = llm.invoke(full_messages)
         generated_text = llm_response.content
-    except Exception as e:
-        print(f"Groq Core Execution Exception: {e}")
+    except Exception:
+        logger.exception("Groq LLM invocation failed")
         generated_text = "⚠️ I encountered an API communication fault while analyzing the system matrix. Please resubmit."
 
     return {
         "final_response": generated_text,
-        "chat_history": [AIMessage(content=generated_text)]
+        "chat_history": [AIMessage(content=generated_text)],
+        "available_images": available_images_context,
     }
 
 # ======================================================
@@ -230,5 +267,43 @@ workflow.add_edge("text_retrieval", "synthesis")
 workflow.add_edge("image_retrieval", "synthesis")
 workflow.add_edge("synthesis", END)
 
-memory = MemorySaver()
-aegis_graph = workflow.compile(checkpointer=memory)
+# ======================================================
+# Checkpointer: persistent, multi-worker-safe (Postgres/Neon)
+# ======================================================
+# MemorySaver is in-process/in-memory only: it does not survive restarts and
+# breaks silently across multiple worker processes (e.g. `uvicorn --workers N`),
+# since each worker has its own memory and a session's follow-up turn could
+# land on a worker that never saw the earlier turns. We use PostgresSaver,
+# backed by the same Neon database already used elsewhere in this project, so
+# conversation state is durable and shared correctly across all workers.
+#
+# checkpoint_pool is exposed at module level so the FastAPI app can close it
+# cleanly on shutdown (see main.py's shutdown_event).
+checkpoint_pool: Optional[ConnectionPool] = None
+
+if NEON_DATABASE_URL:
+    try:
+        checkpoint_pool = ConnectionPool(
+            conninfo=NEON_DATABASE_URL,
+            max_size=20,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+            open=True,
+        )
+        checkpointer = PostgresSaver(checkpoint_pool)
+        checkpointer.setup()  # idempotent: creates checkpoint tables if missing
+        logger.info("Checkpointer: using PostgresSaver backed by Neon (persistent, multi-worker safe).")
+    except Exception:
+        logger.exception(
+            "Failed to initialize Postgres checkpointer; falling back to in-memory "
+            "MemorySaver. This is NOT safe for multi-worker deployments or restarts — "
+            "fix NEON_DATABASE_URL / Postgres connectivity before going to production."
+        )
+        checkpointer = MemorySaver()
+else:
+    logger.warning(
+        "NEON_DATABASE_URL is not set; falling back to in-memory MemorySaver. "
+        "This is NOT safe for multi-worker deployments or restarts."
+    )
+    checkpointer = MemorySaver()
+
+aegis_graph = workflow.compile(checkpointer=checkpointer)

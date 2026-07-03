@@ -1,4 +1,5 @@
 import os
+import logging
 from dotenv import load_dotenv
 
 from sqlalchemy import create_engine, text
@@ -12,9 +13,18 @@ from qdrant_client import QdrantClient
 
 load_dotenv()
 
+logger = logging.getLogger("aegis.database")
+logging.basicConfig(level=logging.INFO)
+
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL")
+
+if not QDRANT_URL or not NEON_DATABASE_URL:
+    logger.warning(
+        "One or more required env vars are missing (QDRANT_URL / NEON_DATABASE_URL). "
+        "Connections will fail until these are set."
+    )
 
 # ======================================================
 # Qdrant Connection
