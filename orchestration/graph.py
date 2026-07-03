@@ -15,7 +15,11 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 # Ingestion/Retrieval & Generation deps
 from qdrant_client import QdrantClient
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
-from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
+
+# Guardrails
+from guardrails.moderation import check_moderation
+from guardrails.pii_redaction import redact_pii
 
 load_dotenv()
 
@@ -26,8 +30,16 @@ logging.basicConfig(level=logging.INFO)
 # Config
 # ======================================================
 # Cap how many prior turns get replayed into the LLM on every call.
-# Each "turn" here is one HumanMessage or one AIMessage entry.
-MAX_HISTORY_MESSAGES = 20  # ~10 user/assistant exchanges
+# Tuned down to 5 to prevent token bloat and keep historical contexts immediate.
+MAX_HISTORY_MESSAGES = 5  
+
+# Vector search similarity filtering threshold
+RETRIEVAL_SIMILARITY_THRESHOLD = 0.35
+
+MODERATION_REFUSAL_MESSAGE = (
+    "I'm not able to help with that request. If you think this was flagged "
+    "in error, please rephrase or contact support."
+)
 
 # ======================================================
 # State Schema Setup
@@ -44,6 +56,9 @@ class AegisState(TypedDict):
     vlm_query_description: Optional[str]
     available_images: List[Dict[str, Any]]
     final_response: Optional[str]
+    moderation_flagged: Optional[bool]
+    moderation_categories: List[str]
+    pii_redaction_counts: Dict[str, int]
 
 # ======================================================
 # Resource Connectors
@@ -63,19 +78,18 @@ qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 TEXT_COLLECTION = "plc_manuals_text"
 IMAGE_COLLECTION = "plc_manuals_images"
 
-# Initialize Groq Engine for ultra-fast generation
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+# Initialize OpenAI Engine for generation
+llm = ChatOpenAI(
+    model="gpt-4o",
     temperature=0.1,
-    groq_api_key=os.getenv("GROQ_API_KEY")
+    api_key=os.getenv("OPENAI_API_KEY")
 )
 
 # ======================================================
 # Helpers
 # ======================================================
 def _s(value: Any) -> str:
-    """Safely coerce a payload value to str, avoiding the literal 'None' string
-    that str(None) would otherwise produce for genuinely-null payload fields."""
+    """Safely coerce a payload value to str, avoiding the literal 'None' string."""
     if value is None:
         return ""
     return str(value)
@@ -83,6 +97,43 @@ def _s(value: Any) -> str:
 # ======================================================
 # Graph Nodes (Workers)
 # ======================================================
+
+def pii_redact_node(state: AegisState) -> dict:
+    """
+    Step 0: Local regex-based PII redaction. Runs before the query fans out 
+    to moderation and retrieval so both branches see the same redacted text.
+    """
+    raw_query = state.get("user_query") or ""
+    if not raw_query:
+        return {"pii_redaction_counts": {}}
+
+    redacted_query, pii_counts = redact_pii(raw_query)
+    if pii_counts:
+        logger.info(
+            "Redacted PII from incoming query for user_id=%s categories=%s",
+            state.get("user_id"), list(pii_counts.keys()),
+        )
+
+    return {"user_query": redacted_query, "pii_redaction_counts": pii_counts}
+
+
+def moderation_node(state: AegisState) -> dict:
+    """
+    Runs concurrently with input_analysis/retrieval.
+    Provides network check verification before final synthesis gates execute.
+    """
+    query = state.get("user_query") or ""
+    if not query:
+        return {"moderation_flagged": False, "moderation_categories": []}
+
+    mod_result = check_moderation(text=query)
+    if mod_result.flagged:
+        logger.warning(
+            "Moderation flagged incoming query for user_id=%s categories=%s",
+            state.get("user_id"), mod_result.categories,
+        )
+    return {"moderation_flagged": mod_result.flagged, "moderation_categories": mod_result.categories}
+
 
 def input_analysis_node(state: AegisState) -> dict:
     """
@@ -108,15 +159,10 @@ def input_analysis_node(state: AegisState) -> dict:
         text_search = raw_query
         image_search = raw_query
 
-    messages_update = []
-    if raw_query:
-        messages_update.append(HumanMessage(content=raw_query))
-
     return {
         "vlm_query_description": vlm_desc,
         "text_search_query": text_search,
-        "image_search_query": image_search,
-        "chat_history": messages_update
+        "image_search_query": image_search
     }
 
 
@@ -129,7 +175,8 @@ def text_retrieval_node(state: AegisState) -> dict:
         return {"retrieved_text_chunks": []}
     try:
         query_vector = embeddings_model.embed_query(search_target)
-        hits = qdrant_client.search(collection_name=TEXT_COLLECTION, query_vector=query_vector, limit=3)
+        hits = qdrant_client.query_points(collection_name=TEXT_COLLECTION, query=query_vector, limit=3).points
+        hits = [h for h in hits if h.score >= RETRIEVAL_SIMILARITY_THRESHOLD]
         return {"retrieved_text_chunks": [{
             "postgres_chunk_id": _s(hit.payload.get("postgres_chunk_id")),
             "document_id": _s(hit.payload.get("document_id")),
@@ -146,21 +193,20 @@ def text_retrieval_node(state: AegisState) -> dict:
 def image_retrieval_node(state: AegisState) -> dict:
     """
     Step 3: Vector search against manual diagram descriptions.
-    Includes extracting image file targets or payload URLs if present.
     """
     search_target = state.get("image_search_query")
     if not search_target:
         return {"retrieved_image_captions": []}
     try:
         query_vector = embeddings_model.embed_query(search_target)
-        hits = qdrant_client.search(collection_name=IMAGE_COLLECTION, query_vector=query_vector, limit=3)
+        hits = qdrant_client.query_points(collection_name=IMAGE_COLLECTION, query=query_vector, limit=3).points
+        hits = [h for h in hits if h.score >= RETRIEVAL_SIMILARITY_THRESHOLD]
         return {"retrieved_image_captions": [{
             "postgres_chunk_id": _s(hit.payload.get("postgres_chunk_id")),
             "document_id": _s(hit.payload.get("document_id")),
             "page_id": _s(hit.payload.get("page_id")),
             "section_name": hit.payload.get("section_name"),
             "text": _s(hit.payload.get("text")),
-            # Extract image_url or local disk source path if populated in database
             "image_url": _s(hit.payload.get("image_url") or hit.payload.get("image_path")),
             "similarity_score": hit.score
         } for hit in hits]}
@@ -172,22 +218,19 @@ def image_retrieval_node(state: AegisState) -> dict:
 def context_synthesis_node(state: AegisState) -> dict:
     """
     Step 4: Implements the Gemini-styled OmniDoc system architecture.
-    Applies logic checks, out-of-context filters, and dynamically serves reference diagrams.
+    Applies logic checks, handles out-of-context blocks, and requests generation from OpenAI.
     """
     text_chunks = state.get("retrieved_text_chunks", [])
     img_captions = state.get("retrieved_image_captions", [])
     history = state.get("chat_history", [])
 
-    # Compile the retrieved reference context block
     context_blocks = []
     for c in text_chunks:
         context_blocks.append(f"[Manual Text | Doc: {c['document_id']} | Page: {c['page_id']}]: {c['text']}")
 
-    # Store dynamic references to hardware images we have available so the
-    # API layer can also surface them directly (not just via LLM markdown).
     available_images_context = []
     for i in img_captions:
-        img_ref = f"[Visual Diagram | Doc: {i['document_id']} | Page: {i['page_id']}]: {i['text']}"
+        img_ref = f"[Visual Diagram Description | Doc: {i['document_id']} | Page: {i['page_id']}]: {i['text']}"
         if i.get("image_url"):
             img_ref += f"\n👉 AVAILABLE IMAGE REFERENCE FILE (URL/Path): {i['image_url']}"
             available_images_context.append({
@@ -201,53 +244,98 @@ def context_synthesis_node(state: AegisState) -> dict:
     has_context = len(context_blocks) > 0
     context_str = "\n\n".join(context_blocks) if has_context else "No direct manual context retrieved."
 
-    # Custom Adaptive Gemini/OmniDoc Prompt Layout with strict Image Delivery Protocol
+    if state.get("moderation_flagged"):
+        logger.info("Skipping LLM call for user_id=%s — moderation flagged this turn.", state.get("user_id"))
+        return {
+            "final_response": MODERATION_REFUSAL_MESSAGE,
+            "chat_history": [AIMessage(content=MODERATION_REFUSAL_MESSAGE)],
+            "available_images": [],
+        }
+
     system_instruction = SystemMessage(content=(
         "You are Aegis-Vision, an advanced, highly perceptive AI diagnostic assistant specializing "
         "in Siemens PLC systems and industrial automation frameworks. Your communication style is accessible, "
         "highly analytical, and supportive—matching a seasoned systems engineer.\n\n"
         "You are provided with a retrieved 'CONTEXT' section containing text chunks from standard PDFs "
-        "or automated descriptions of uploaded diagrams.\n\n"
+        "and descriptions of automated diagrams.\n\n"
         "CRITICAL DISCREPANCY & TRUTH RULES:\n"
         "1. OBJECTIVE TRUTH & LOGIC FIRST:\n"
         "   Never compromise on objective engineering rules, mathematics, logic, or universal physics facts. "
         "Politely and clearly explain the correct logical framework if inconsistencies exist.\n\n"
         "2. FOR HARD DATA/TEXT DOCUMENTS (PDFs, System Manuals):\n"
-        "   The technical manual document is the source of truth ONLY for what that manual claims or specifies.\n\n"
+        "   The technical manual document is the source of truth for what that manual claims or specifies.\n\n"
         "3. FOR AUTOMATED VISUAL DESCRIPTIONS (Image Context):\n"
-        "   Understand that the context for manual diagrams or uploaded media can come from automated vision parsers. "
-        "Acknowledge parsing variances gently, bridge the gap, and troubleshoot the user's corrected subject layout.\n\n"
+        "   The context block contains structural textual descriptions of diagrams. Use these text descriptions "
+        "   as valuable raw data to extract engineering definitions, LED blink patterns, or wiring pin layouts "
+        "   to answer the question, even if you do not render the physical image file itself.\n\n"
         "4. DYNAMIC IMAGE DELIVERY PROTOCOL:\n"
-        "   - If the user explicitly asks to see a visual diagram, schematic, layout, or image of a device/wiring setup, "
-        "     or if providing a visual reference dramatically simplifies troubleshooting the issue:\n"
-        "     Look through the CONTEXT block for a line stating 'AVAILABLE IMAGE REFERENCE FILE'. If you find an available image url/path, "
-        "     embed it directly into your response text using the exact standard Markdown syntax: ![Image Description](url_or_path_here).\n"
-        "   - If the user asks for an image, or you need one to answer a query, but the reference data does NOT provide a valid URL/path "
-        "     under the AVAILABLE IMAGE section, you MUST tell the user politely and transparently: 'I don't have that specific visual diagram available in my technical references.'\n"
-        "   - If the user uploaded a photo and you find a reference diagram matching their target hardware system closer to the final solution, "
-        "     embed that manual diagram to help them cross-reference structural details.\n\n"
+        "   Answer the user's technical engineering query immediately using all text data and manual descriptions "
+        "   found in the CONTEXT section. Do not refuse to answer simply because a physical image file isn't rendered.\n"
+        "   - Only embed a physical image using markdown syntax `![Image Description](url_or_path_here)` if the "
+        "     user explicitly asks to see an image/layout, AND a matching line stating 'AVAILABLE IMAGE REFERENCE FILE' "
+        "     is present in the context.\n\n"
         "5. OUT-OF-CONTEXT / UNRELATED QUESTIONS:\n"
-        "   If the user asks a question completely unrelated to Siemens PLC systems or industrial automation frameworks, "
-        "   politely inform them that this topic is not available within your context or area of expertise.\n\n"
+        "   If the user asks a question completely unrelated to Siemens PLC systems, industrial electronics, or industrial "
+        "   automation frameworks, politely inform them that this topic is not available within your context.\n\n"
         f"CONTEXT:\n{context_str}"
     ))
 
-    # Trim replayed history so long-running sessions don't blow up token usage
-    # or latency on every single turn.
-    trimmed_history = history[-MAX_HISTORY_MESSAGES:] if history else history
-    full_messages = [system_instruction] + trimmed_history
+    # Keep only the most recent conversation turns
+    trimmed_history = history[-MAX_HISTORY_MESSAGES:] if history else []
+
+    # Current user query (after PII redaction)
+    current_query = state.get("user_query") or ""
+
+    # Build the conversation for the LLM
+    full_messages = [system_instruction]
+    full_messages.extend(trimmed_history)
+
+    # Always append the current user message
+    if current_query:
+        full_messages.append(HumanMessage(content=current_query))
 
     try:
         llm_response = llm.invoke(full_messages)
         generated_text = llm_response.content
+        if not generated_text:
+            logger.warning(
+                "OpenAI returned empty content for user_id=%s (finish_reason=%s); "
+                "substituting a fallback response instead of an empty string.",
+                state.get("user_id"),
+                getattr(llm_response, "response_metadata", {}).get("finish_reason"),
+            )
+            generated_text = (
+                "I wasn't able to generate a response to that. Could you rephrase "
+                "your question, or let me know if it's related to a Siemens PLC "
+                "or industrial automation issue?"
+            )
     except Exception:
-        logger.exception("Groq LLM invocation failed")
+        logger.exception("OpenAI LLM invocation failed")
         generated_text = "⚠️ I encountered an API communication fault while analyzing the system matrix. Please resubmit."
 
+    redacted_text, pii_counts = redact_pii(generated_text)
+    if pii_counts:
+        logger.info(
+            "Redacted PII from outbound LLM response for user_id=%s categories=%s",
+            state.get("user_id"), list(pii_counts.keys()),
+        )
+
+    # Persist the latest conversation turn
+    messages_to_store = []
+
+    if current_query:
+        messages_to_store.append(HumanMessage(content=current_query))
+
+    messages_to_store.append(AIMessage(content=redacted_text))
+
     return {
-        "final_response": generated_text,
-        "chat_history": [AIMessage(content=generated_text)],
+        "final_response": redacted_text,
+        "chat_history": messages_to_store,
         "available_images": available_images_context,
+        "pii_redaction_counts": {
+            **state.get("pii_redaction_counts", {}),
+            **pii_counts,
+        },
     }
 
 # ======================================================
@@ -255,30 +343,30 @@ def context_synthesis_node(state: AegisState) -> dict:
 # ======================================================
 workflow = StateGraph(AegisState)
 
+workflow.add_node("pii_redact", pii_redact_node)
+workflow.add_node("moderation", moderation_node)
 workflow.add_node("input_analysis", input_analysis_node)
 workflow.add_node("text_retrieval", text_retrieval_node)
 workflow.add_node("image_retrieval", image_retrieval_node)
 workflow.add_node("synthesis", context_synthesis_node)
 
-workflow.add_edge(START, "input_analysis")
+workflow.add_edge(START, "pii_redact")
+
+workflow.add_edge("pii_redact", "moderation")
+workflow.add_edge("pii_redact", "input_analysis")
+
 workflow.add_edge("input_analysis", "text_retrieval")
 workflow.add_edge("input_analysis", "image_retrieval")
+
+workflow.add_edge("moderation", "synthesis")
 workflow.add_edge("text_retrieval", "synthesis")
 workflow.add_edge("image_retrieval", "synthesis")
+
 workflow.add_edge("synthesis", END)
 
 # ======================================================
 # Checkpointer: persistent, multi-worker-safe (Postgres/Neon)
 # ======================================================
-# MemorySaver is in-process/in-memory only: it does not survive restarts and
-# breaks silently across multiple worker processes (e.g. `uvicorn --workers N`),
-# since each worker has its own memory and a session's follow-up turn could
-# land on a worker that never saw the earlier turns. We use PostgresSaver,
-# backed by the same Neon database already used elsewhere in this project, so
-# conversation state is durable and shared correctly across all workers.
-#
-# checkpoint_pool is exposed at module level so the FastAPI app can close it
-# cleanly on shutdown (see main.py's shutdown_event).
 checkpoint_pool: Optional[ConnectionPool] = None
 
 if NEON_DATABASE_URL:
@@ -290,19 +378,17 @@ if NEON_DATABASE_URL:
             open=True,
         )
         checkpointer = PostgresSaver(checkpoint_pool)
-        checkpointer.setup()  # idempotent: creates checkpoint tables if missing
+        checkpointer.setup()
         logger.info("Checkpointer: using PostgresSaver backed by Neon (persistent, multi-worker safe).")
     except Exception:
         logger.exception(
             "Failed to initialize Postgres checkpointer; falling back to in-memory "
-            "MemorySaver. This is NOT safe for multi-worker deployments or restarts — "
-            "fix NEON_DATABASE_URL / Postgres connectivity before going to production."
+            "MemorySaver. This is NOT safe for multi-worker deployments or restarts."
         )
         checkpointer = MemorySaver()
 else:
     logger.warning(
-        "NEON_DATABASE_URL is not set; falling back to in-memory MemorySaver. "
-        "This is NOT safe for multi-worker deployments or restarts."
+        "NEON_DATABASE_URL is not set; falling back to in-memory MemorySaver."
     )
     checkpointer = MemorySaver()
 
