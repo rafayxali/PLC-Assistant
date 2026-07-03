@@ -1,152 +1,234 @@
 import os
+from typing import List, Optional, Dict, Any, Annotated
+from typing_extensions import TypedDict
 from dotenv import load_dotenv
+
+# LangGraph & LangChain Core
 from langgraph.graph import StateGraph, START, END
-from orchestration.schemas import AegisState
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+
+# Ingestion/Retrieval & Generation deps
+from qdrant_client import QdrantClient
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_groq import ChatGroq
 
 load_dotenv()
 
 # ======================================================
-# 1. Node Definitions (Workers)
+# State Schema Setup
+# ======================================================
+class AegisState(TypedDict):
+    user_id: str
+    user_query: Optional[str]
+    attached_image_path: Optional[str]
+    chat_history: Annotated[List[BaseMessage], add_messages]
+    text_search_query: str
+    image_search_query: str
+    retrieved_text_chunks: List[Dict[str, Any]]
+    retrieved_image_captions: List[Dict[str, Any]]
+    vlm_query_description: Optional[str]
+    final_response: Optional[str]
+
+# ======================================================
+# Resource Connectors
+# ======================================================
+HF_TOKEN = os.getenv("HUGGINGFACEHUB_ACCESS_TOKEN")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+# Initialize Vector Search Model
+embeddings_model = HuggingFaceEndpointEmbeddings(
+    repo_id="sentence-transformers/all-MiniLM-L6-v2",
+    huggingfacehub_api_token=HF_TOKEN
+)
+
+qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+TEXT_COLLECTION = "plc_manuals_text"
+IMAGE_COLLECTION = "plc_manuals_images"
+
+# Initialize Groq Engine for ultra-fast generation
+llm = ChatGroq(
+    model="llama-3.3-70b-specdec", 
+    temperature=0.1, 
+    groq_api_key=os.getenv("GROQ_API_KEY")
+)
+
+# ======================================================
+# Graph Nodes (Workers)
 # ======================================================
 
 def input_analysis_node(state: AegisState) -> dict:
     """
-    Step 1: Analyzes inputs. If an image is present, the VLM generates a 
-    description. Then, cross-retrieval strings are built for BOTH vector collections.
+    Step 1: Analyzes inbound technician data. Processes text requests 
+    and handles diagnostic files without static mock text.
     """
-    print("\n[Node: Input Analysis] Parsing query components...")
-    raw_query = state.get("user_query", "") or ""
+    raw_query = state.get("user_query") or ""
     image_path = state.get("attached_image_path")
     
     vlm_desc = None
     if image_path:
-        # MOCK: In production, this calls GPT-4o to analyze the technician's photo
-        vlm_desc = "User photo displays a blinking Red SF LED on an S7-1200 central rack unit."
-        print(f" -> VLM Photo Analysis: '{vlm_desc}'")
+        filename = os.path.basename(image_path)
+        vlm_desc = f"Technician attached a diagnostic file resource link: ({filename})"
 
-    # --- Cross-Retrieval Logic Construction ---
-    # We combine text strings and visual interpretations so that BOTH search types 
-    # inherit keywords from the alternative modalities.
+    # Construct clean search context vectors using actual text inputs
     if raw_query and vlm_desc:
         text_search = f"{raw_query} {vlm_desc}"
         image_search = f"{raw_query} {vlm_desc}"
     elif vlm_desc:
-        # Even if there is NO text query, the image description searches BOTH spaces
-        text_search = vlm_desc
-        image_search = vlm_desc
+        text_search = "PLC hardware interface fault diagnostic"
+        image_search = "PLC layout diagnostic"
     else:
         text_search = raw_query
         image_search = raw_query
 
-    print(f" -> Text Space Query Target: '{text_search}'")
-    print(f" -> Image Space Query Target: '{image_search}'")
-
+    messages_update = []
+    if raw_query:
+        messages_update.append(HumanMessage(content=raw_query))
+        
     return {
         "vlm_query_description": vlm_desc,
         "text_search_query": text_search,
-        "image_search_query": image_search
+        "image_search_query": image_search,
+        "chat_history": messages_update
     }
 
 
 def text_retrieval_node(state: AegisState) -> dict:
     """
-    Queries plc_manuals_text using the cross-retrieval string.
+    Step 2: Vector search against manual text chunks.
     """
     search_target = state.get("text_search_query")
-    print(f"[Node: Text Retrieval] Querying 'plc_manuals_text' vector space with: '{search_target}'...")
-    
-    # Mocking a text match based on keywords inside the search target
-    mock_chunks = []
-    if "SF" in search_target or "System Fault" in search_target:
-        mock_chunks.append({
-            "chunk_text": "S7-1200 Hardware Section 4.1: A red SF (System Fault) light indicates firmware exception or module mismatch.",
-            "source": "S7-1200 System Manual, p. 412"
-        })
-    return {"retrieved_text_chunks": mock_chunks}
+    if not search_target:
+        return {"retrieved_text_chunks": []}
+    try:
+        query_vector = embeddings_model.embed_query(search_target)
+        hits = qdrant_client.search(collection_name=TEXT_COLLECTION, query_vector=query_vector, limit=3)
+        return {"retrieved_text_chunks": [{
+            "postgres_chunk_id": str(hit.payload.get("postgres_chunk_id", "")),
+            "document_id": str(hit.payload.get("document_id", "")),
+            "page_id": str(hit.payload.get("page_id", "")),
+            "section_name": hit.payload.get("section_name"),
+            "text": str(hit.payload.get("text", "")),
+            "similarity_score": hit.score
+        } for hit in hits]}
+    except Exception:
+        return {"retrieved_text_chunks": []}
 
 
 def image_retrieval_node(state: AegisState) -> dict:
     """
-    Queries plc_manuals_images using the cross-retrieval string.
+    Step 3: Vector search against manual diagram descriptions.
+    Includes extracting image file targets or payload URLs if present.
     """
     search_target = state.get("image_search_query")
-    print(f"[Node: Image Retrieval] Querying 'plc_manuals_images' vector space with: '{search_target}'...")
-    
-    # Mocking an image diagram caption match based on keywords inside the search target
-    mock_images = []
-    if "rack" in search_target or "LED" in search_target or "SF" in search_target:
-        mock_images.append({
-            "caption": "Figure 4-2: S7-1200 CPU Module LED indicator layout showing SF location.",
-            "image_path": "data/images/fig_4_2.png"
-        })
-    return {"retrieved_image_captions": mock_images}
+    if not search_target:
+        return {"retrieved_image_captions": []}
+    try:
+        query_vector = embeddings_model.embed_query(search_target)
+        hits = qdrant_client.search(collection_name=IMAGE_COLLECTION, query_vector=query_vector, limit=3)
+        return {"retrieved_image_captions": [{
+            "postgres_chunk_id": str(hit.payload.get("postgres_chunk_id", "")),
+            "document_id": str(hit.payload.get("document_id", "")),
+            "page_id": str(hit.payload.get("page_id", "")),
+            "section_name": hit.payload.get("section_name"),
+            "text": str(hit.payload.get("text", "")),
+            # Extract image_url or local disk source path if populated in database
+            "image_url": str(hit.payload.get("image_url") or hit.payload.get("image_path") or ""),
+            "similarity_score": hit.score
+        } for hit in hits]}
+    except Exception:
+        return {"retrieved_image_captions": []}
 
 
 def context_synthesis_node(state: AegisState) -> dict:
     """
-    Gathers all cross-retrieved information to generate a safe resolution response.
+    Step 4: Implements the Gemini-styled OmniDoc system architecture.
+    Applies logic checks, out-of-context filters, and dynamically serves reference diagrams.
     """
-    print("[Node: Context Synthesis] Packaging all collected knowledge blocks...")
+    text_chunks = state.get("retrieved_text_chunks", [])
+    img_captions = state.get("retrieved_image_captions", [])
+    history = state.get("chat_history", [])
     
-    text_context = "\n".join([c["chunk_text"] for c in state.get("retrieved_text_chunks", [])])
-    img_context = "\n".join([i["caption"] for i in state.get("retrieved_image_captions", [])])
+    # Compile the retrieved reference context block
+    context_blocks = []
+    for c in text_chunks:
+        context_blocks.append(f"[Manual Text | Doc: {c['document_id']} | Page: {c['page_id']}]: {c['text']}")
     
-    response = (
-        "### Aegis Multi-Modal Diagnostic Resolution\n\n"
-        f"**Grounded Reference Materials Discovered:**\n"
-        f"- *Manual Text Chapter Details:* {text_context if text_context else 'None referenced.'}\n"
-        f"- *Manual Diagram Layout Context:* {img_context if img_context else 'None referenced.'}"
-    )
-    return {"final_response": response}
+    # Store dynamic references to hardware images we have available
+    available_images_context = []
+    for i in img_captions:
+        img_ref = f"[Visual Diagram | Doc: {i['document_id']} | Page: {i['page_id']}]: {i['text']}"
+        if i.get("image_url"):
+            img_ref += f"\n👉 AVAILABLE IMAGE REFERENCE FILE (URL/Path): {i['image_url']}"
+            available_images_context.append({"url": i['image_url'], "text": i['text']})
+        context_blocks.append(img_ref)
+        
+    has_context = len(context_blocks) > 0
+    context_str = "\n\n".join(context_blocks) if has_context else "No direct manual context retrieved."
+
+    # Custom Adaptive Gemini/OmniDoc Prompt Layout with strict Image Delivery Protocol
+    system_instruction = SystemMessage(content=(
+        "You are Aegis-Vision, an advanced, highly perceptive AI diagnostic assistant specializing "
+        "in Siemens PLC systems and industrial automation frameworks. Your communication style is accessible, "
+        "highly analytical, and supportive—matching a seasoned systems engineer.\n\n"
+        "You are provided with a retrieved 'CONTEXT' section containing text chunks from standard PDFs "
+        "or automated descriptions of uploaded diagrams.\n\n"
+        "CRITICAL DISCREPANCY & TRUTH RULES:\n"
+        "1. OBJECTIVE TRUTH & LOGIC FIRST:\n"
+        "   Never compromise on objective engineering rules, mathematics, logic, or universal physics facts. "
+        "Politely and clearly explain the correct logical framework if inconsistencies exist.\n\n"
+        "2. FOR HARD DATA/TEXT DOCUMENTS (PDFs, System Manuals):\n"
+        "   The technical manual document is the source of truth ONLY for what that manual claims or specifies.\n\n"
+        "3. FOR AUTOMATED VISUAL DESCRIPTIONS (Image Context):\n"
+        "   Understand that the context for manual diagrams or uploaded media can come from automated vision parsers. "
+        "Acknowledge parsing variances gently, bridge the gap, and troubleshoot the user's corrected subject layout.\n\n"
+        "4. DYNAMIC IMAGE DELIVERY PROTOCOL:\n"
+        "   - If the user explicitly asks to see a visual diagram, schematic, layout, or image of a device/wiring setup, "
+        "     or if providing a visual reference dramatically simplifies troubleshooting the issue:\n"
+        "     Look through the CONTEXT block for a line stating 'AVAILABLE IMAGE REFERENCE FILE'. If you find an available image url/path, "
+        "     embed it directly into your response text using the exact standard Markdown syntax: ![Image Description](url_or_path_here).\n"
+        "   - If the user asks for an image, or you need one to answer a query, but the reference data does NOT provide a valid URL/path "
+        "     under the AVAILABLE IMAGE section, you MUST tell the user politely and transparently: 'I don't have that specific visual diagram available in my technical references.'\n"
+        "   - If the user uploaded a photo and you find a reference diagram matching their target hardware system closer to the final solution, "
+        "     embed that manual diagram to help them cross-reference structural details.\n\n"
+        "5. OUT-OF-CONTEXT / UNRELATED QUESTIONS:\n"
+        "   If the user asks a question completely unrelated to Siemens PLC systems or industrial automation frameworks, "
+        "   politely inform them that this topic is not available within your context or area of expertise.\n\n"
+        f"CONTEXT:\n{context_str}"
+    ))
+
+    full_messages = [system_instruction] + history
+
+    try:
+        llm_response = llm.invoke(full_messages)
+        generated_text = llm_response.content
+    except Exception as e:
+        print(f"Groq Core Execution Exception: {e}")
+        generated_text = "⚠️ I encountered an API communication fault while analyzing the system matrix. Please resubmit."
+
+    return {
+        "final_response": generated_text,
+        "chat_history": [AIMessage(content=generated_text)]
+    }
 
 # ======================================================
-# 2. LangGraph Construction (Parallel Flow Architecture)
+# LangGraph Workflow Execution Compilation
 # ======================================================
-
 workflow = StateGraph(AegisState)
 
-# Add our explicit processing steps
 workflow.add_node("input_analysis", input_analysis_node)
 workflow.add_node("text_retrieval", text_retrieval_node)
 workflow.add_node("image_retrieval", image_retrieval_node)
 workflow.add_node("synthesis", context_synthesis_node)
 
-# Step 1: Run Input Analysis
 workflow.add_edge(START, "input_analysis")
-
-# Step 2: Fan out into BOTH vector spaces at the same time to ensure cross-retrieval
 workflow.add_edge("input_analysis", "text_retrieval")
 workflow.add_edge("input_analysis", "image_retrieval")
-
-# Step 3: Direct the output of both collection lookups into the Synthesis engine
 workflow.add_edge("text_retrieval", "synthesis")
 workflow.add_edge("image_retrieval", "synthesis")
-
-# End path execution boundary
 workflow.add_edge("synthesis", END)
 
-app = workflow.compile()
-
-# ======================================================
-# 3. Operational Edge Case Testing
-# ======================================================
-if __name__ == "__main__":
-    print("--- Test Case A: IMAGE ONLY Upload (Should search text AND images) ---")
-    state_image_only = app.invoke({
-        "user_id": "eng_01",
-        "user_query": None,
-        "attached_image_path": "data/attachments/panel_light.png",
-        "retrieved_text_chunks": [],
-        "retrieved_image_captions": []
-    })
-    print(state_image_only["final_response"])
-
-    print("\n--- Test Case B: TEXT ONLY Query (Should search text AND images) ---")
-    state_text_only = app.invoke({
-        "user_id": "eng_01",
-        "user_query": "S7-1200 SF LED status diagnostics",
-        "attached_image_path": None,
-        "retrieved_text_chunks": [],
-        "retrieved_image_captions": []
-    })
-    print(state_text_only["final_response"])
+memory = MemorySaver()
+aegis_graph = workflow.compile(checkpointer=memory)
