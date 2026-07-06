@@ -12,6 +12,12 @@ from app.uploads import resolve_upload_path, save_upload_file
 from database.database import get_db, test_neon, test_qdrant
 from orchestration.graph import aegis_graph, checkpoint_pool
 
+# Import the rate limiting dependency components.
+# NOTE: we do NOT import the raw `redis_client` variable here anymore - that
+# was a bug (see token_bucket.py docstring on close_redis_client). Always go
+# through get_redis_client() / close_redis_client() instead.
+from ratelimit.token_bucket import get_redis_client, close_redis_client, RateLimitDependency
+
 logger = logging.getLogger("aegis.main")
 logging.basicConfig(level=logging.INFO)
 
@@ -20,6 +26,13 @@ app = FastAPI(
     description="Production industrial RAG API gateway executing state-managed conversation routing.",
     version="1.0.0"
 )
+
+# Instantiate rate limiter targeting exactly 5 queries per minute per IP address
+# max_tokens=5: Permits immediate 5-turn response spikes when needed
+# refill_rate=5/60: Generates tokens continuously, fully refilling over 60s
+# (kept as the exact fraction 5/60 rather than a rounded 0.083 so the
+# "5 per minute" comment is literally true over long-running processes).
+chat_rate_limiter = RateLimitDependency(max_tokens=5, refill_rate=5 / 60)
 
 # Configure allowed origins via env var (comma-separated). Falls back to "*"
 # for local development only — wildcard origin + allow_credentials=True is
@@ -44,16 +57,34 @@ app.add_middleware(
 )
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     print("\n[System Startup] Verifying active infrastructure connections...")
     test_neon()
     test_qdrant()
 
+    # Establish connection and verify host status using clean, native async/await
+    try:
+        await get_redis_client().ping()
+        print("[System Startup] Native local Redis service connected successfully.")
+    except Exception as e:
+        logger.error("Failed to connect to Redis during startup: %s", e)
+        raise e
+
 @app.on_event("shutdown")
-def shutdown_event():
+async def shutdown_event():
     if checkpoint_pool is not None:
         checkpoint_pool.close()
         print("[System Shutdown] Closed Postgres checkpoint connection pool.")
+
+    # Gracefully disconnect and clean up active Redis sockets natively.
+    # Routed through close_redis_client() (rather than a locally-imported
+    # `redis_client` reference) so we always close the actual live client
+    # living inside the token_bucket module.
+    try:
+        await close_redis_client()
+        print("[System Shutdown] Closed Redis client pool connections.")
+    except Exception as e:
+        logger.error("Error closing Redis connection pool: %s", e)
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["System Health"])
 def health_check():
@@ -81,7 +112,11 @@ def _safe_str(value: Any) -> str:
 
 
 @app.post("/api/v1/chat", response_model=ChatResponse, tags=["Orchestration"])
-def execution_chat_pipeline(payload: ChatRequest, db: Session = Depends(get_db)):
+def execution_chat_pipeline(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    _=Depends(chat_rate_limiter)  # Enforces the Token Bucket limit here before processing
+):
     """
     Primary API endpoint processing technician queries using persistent, multi-turn LangGraph memory.
     """
