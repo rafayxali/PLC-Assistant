@@ -457,6 +457,3 @@ If moderation flags a turn, `answer` returns a standard refusal message instead 
 
 ---
 
-## 11. License
-
-Add your license here (e.g. MIT, Apache 2.0, or proprietary).
